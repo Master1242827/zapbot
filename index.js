@@ -15,7 +15,7 @@ const CONFIG = {
 const EVOLUTION_URL      = process.env.EVOLUTION_URL;
 const EVOLUTION_APIKEY   = process.env.EVOLUTION_APIKEY;
 const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE;
-const ANTHROPIC_KEY      = process.env.ANTHROPIC_API_KEY;
+const GROQ_API_KEY       = process.env.GROQ_API_KEY;
 
 const conversations = {};
 
@@ -30,32 +30,36 @@ Regras:
 - Seja breve e direto (máximo 3 parágrafos curtos)
 - Use emojis com moderação
 - Se não souber algo, diga que vai verificar
-- Se o cliente quiser falar com humano, diga que vai transferir e escreva TRANSFERIR_HUMANO no final`;
+- Se o cliente quiser falar com humano, escreva TRANSFERIR_HUMANO no final`;
 }
 
-async function askClaude(phoneNumber, userMessage) {
+async function askGroq(phoneNumber, userMessage) {
   if (!conversations[phoneNumber]) conversations[phoneNumber] = [];
   conversations[phoneNumber].push({ role: "user", content: userMessage });
   if (conversations[phoneNumber].length > 20) {
     conversations[phoneNumber] = conversations[phoneNumber].slice(-20);
   }
+
   const response = await axios.post(
-    "https://api.anthropic.com/v1/messages",
+    "https://api.groq.com/openai/v1/chat/completions",
     {
-      model: "claude-sonnet-4-6",
+      model: "llama-3.3-70b-versatile",
+      messages: [
+        { role: "system", content: systemPrompt() },
+        ...conversations[phoneNumber],
+      ],
       max_tokens: 1000,
-      system: systemPrompt(),
-      messages: conversations[phoneNumber],
+      temperature: 0.7,
     },
     {
       headers: {
-        "x-api-key": ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01",
+        "Authorization": `Bearer ${GROQ_API_KEY}`,
         "Content-Type": "application/json",
       },
     }
   );
-  const reply = response.data.content[0].text;
+
+  const reply = response.data.choices[0].message.content;
   conversations[phoneNumber].push({ role: "assistant", content: reply });
   return reply;
 }
@@ -80,7 +84,7 @@ app.post("/webhook", async (req, res) => {
       body.data.message.extendedTextMessage?.text || "";
     if (!message.trim()) return;
     console.log(`📩 [${phone}] ${message}`);
-    const reply = await askClaude(phone, message);
+    const reply = await askGroq(phone, message);
     console.log(`🤖 [${phone}] ${reply}`);
     if (reply.includes("TRANSFERIR_HUMANO")) {
       const cleanReply = reply.replace("TRANSFERIR_HUMANO", "").trim();
@@ -98,6 +102,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "✅ ZapBot online",
     business: CONFIG.businessName,
+    ai: "Groq (gratuito)",
     conversations: Object.keys(conversations).length,
   });
 });
@@ -105,4 +110,5 @@ app.get("/", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`⚡ ZapBot rodando na porta ${PORT}`);
+  console.log(`🤖 IA: Groq (gratuito)`);
 });
