@@ -1,13 +1,11 @@
 {
   "name": "zapbot",
   "version": "1.0.0",
-  "description": "Atendente virtual com IA para WhatsApp",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "@supabase/supabase-js": "^2.39.0"
   }
 }
