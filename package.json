@@ -8,4 +8,5 @@
     "axios": "^1.6.0",
     "@supabase/supabase-js": "^2.39.0"
   }
+  
 }
