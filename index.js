@@ -3,17 +3,25 @@ const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json());
 
 const GROQ_API_KEY     = process.env.GROQ_API_KEY;
 const EVOLUTION_URL    = process.env.EVOLUTION_URL;
 const EVOLUTION_APIKEY = process.env.EVOLUTION_APIKEY;
 const SUPABASE_URL     = process.env.SUPABASE_URL     || "https://fzfsjlvexftdllgzohac.supabase.co";
 const SUPABASE_KEY     = process.env.SUPABASE_KEY     || "sb_publishable_9xMIUH8FdUXvyQ0o7GIfpQ_rXYe0Idp";
+const MP_ACCESS_TOKEN  = process.env.MP_ACCESS_TOKEN; // Token privado do Mercado Pago (não é a chave pública)
 
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Limites por plano
+// Mapeia o valor pago para o nome do plano
+function planFromAmount(amount) {
+  if (amount >= 490) return "agency";
+  if (amount >= 190) return "pro";
+  if (amount >= 90)  return "basico";
+  return "basico";
+}
+
 const PLAN_LIMITS = {
   basico:  { messages: 500,   transfer: false },
   pro:     { messages: 99999, transfer: true  },
@@ -22,115 +30,91 @@ const PLAN_LIMITS = {
 
 const conversations = {};
 
-// Busca configuração do cliente pelo número da instância
+// ─── FUNÇÕES DE ATENDIMENTO (já existentes) ──────────────────────────────────
 async function getClientConfig(instanceName) {
   try {
-    // Remove o prefixo "zapbot-" para pegar só o ID parcial
     const userIdPartial = instanceName.replace(/^zapbot-/i, "").trim().toLowerCase();
-    console.log(`🔍 Procurando cliente para instância: "${instanceName}" (partial: "${userIdPartial}")`);
-
-    const { data: profiles, error } = await sb.from("profiles").select("*");
-    if (error) {
-      console.log(`❌ Erro ao buscar perfis: ${error.message}`);
-      return null;
-    }
-
-    console.log(`📋 Total de perfis no banco: ${profiles?.length || 0}`);
-    profiles?.forEach(p => console.log(`   - ID: ${p.id} | Nome: ${p.name}`));
-
-    // Tenta match flexível: id começa com o partial OU partial está contido no id
+    const { data: profiles } = await sb.from("profiles").select("*");
     const profile = profiles?.find(p => {
       const idLower = p.id.toLowerCase();
       return idLower.startsWith(userIdPartial) || idLower.replace(/-/g, "").startsWith(userIdPartial.replace(/-/g, ""));
     });
-
-    if (!profile) {
-      console.log(`❌ Nenhum perfil encontrado para: ${userIdPartial}`);
-      return null;
-    }
-
-    console.log(`✅ Cliente encontrado: ${profile.name} (${profile.id})`);
-
+    if (!profile) return null;
     const { data: botConfig } = await sb.from("bot_configs").select("*").eq("user_id", profile.id).single();
     return { profile, botConfig };
   } catch (e) {
-    console.log(`❌ Exceção em getClientConfig: ${e.message}`);
     return null;
   }
 }
 
-// Verifica se modo automático está ativo (salvo no banco futuramente)
-async function isAutoMode(userId) {
-  // Por enquanto sempre true — no futuro salvar no banco
-  return true;
+// Verifica se o cliente tem acesso válido (trial ativo OU pagamento em dia)
+function hasValidAccess(profile) {
+  if (!profile.active) return false;
+  if (profile.payment_status === "active") return true;
+  if (profile.payment_status === "trial") {
+    const trialEnd = new Date(profile.trial_ends_at);
+    return trialEnd > new Date();
+  }
+  return false; // expired ou cancelled
 }
 
-// Verifica limite de mensagens do mês
 async function checkMessageLimit(userId, plan) {
   const limit = PLAN_LIMITS[plan]?.messages || 500;
   if (limit >= 99999) return true;
-
   const startOfMonth = new Date();
   startOfMonth.setDate(1);
   startOfMonth.setHours(0, 0, 0, 0);
-
-  const { count } = await sb.from("messages")
-    .select("*", { count: "exact" })
-    .eq("user_id", userId)
-    .eq("direction", "in")
-    .gte("created_at", startOfMonth.toISOString());
-
+  const { count } = await sb.from("messages").select("*", { count: "exact" })
+    .eq("user_id", userId).eq("direction", "in").gte("created_at", startOfMonth.toISOString());
   return (count || 0) < limit;
 }
 
 async function askGroq(instanceName, phoneNumber, userMessage, botConfig) {
   if (!conversations[instanceName]) conversations[instanceName] = {};
   if (!conversations[instanceName][phoneNumber]) conversations[instanceName][phoneNumber] = [];
-
   const history = conversations[instanceName][phoneNumber];
   history.push({ role: "user", content: userMessage });
   if (history.length > 20) history.splice(0, history.length - 20);
 
   const systemPrompt = `Você é um atendente virtual da empresa "${botConfig?.business_name || "Empresa"}".
 Tom de atendimento: ${botConfig?.tone || "amigável e profissional"}.
-Horário de funcionamento: ${botConfig?.hours || "Seg a Sex, 8h às 18h"}.
-Serviços: ${botConfig?.services || "Atendimento ao cliente"}.
+Segmento: ${botConfig?.niche || ""}.
+Horário: ${botConfig?.hours || ""}.
+Endereço: ${botConfig?.address || ""}.
+Produtos/Serviços: ${botConfig?.services || ""}.
+Faixa de preço: ${botConfig?.price_range || ""}.
+Formas de pagamento: ${botConfig?.payment || ""}.
+Frete/Entrega: ${botConfig?.shipping || ""}.
+Prazo de entrega: ${botConfig?.delivery || ""}.
+${botConfig?.pay_link ? `Link de pagamento/catálogo: ${botConfig.pay_link}` : ""}
+${botConfig?.instagram ? `Instagram: @${botConfig.instagram}` : ""}
+${botConfig?.website ? `Site: ${botConfig.website}` : ""}
 ${botConfig?.extra ? `Informações extras: ${botConfig.extra}` : ""}
 Regras:
 - Responda SEMPRE em português brasileiro
 - Seja breve e direto (máximo 3 parágrafos curtos)
 - Use emojis com moderação
 - Se não souber algo, diga que vai verificar
-- Se o cliente quiser falar com humano, escreva TRANSFERIR_HUMANO no final da mensagem`;
+- Se o cliente quiser falar com humano, escreva TRANSFERIR_HUMANO no final`;
 
   const response = await axios.post(
     "https://api.groq.com/openai/v1/chat/completions",
-    {
-      model: "llama-3.3-70b-versatile",
-      messages: [{ role: "system", content: systemPrompt }, ...history],
-      max_tokens: 1000,
-      temperature: 0.7,
-    },
+    { model: "llama-3.3-70b-versatile", messages: [{ role: "system", content: systemPrompt }, ...history], max_tokens: 1000, temperature: 0.7 },
     { headers: { "Authorization": `Bearer ${GROQ_API_KEY}`, "Content-Type": "application/json" } }
   );
-
   const reply = response.data.choices[0].message.content;
   history.push({ role: "assistant", content: reply });
   return reply;
 }
 
 async function sendWhatsApp(instanceName, phone, message) {
-  await axios.post(
-    `${EVOLUTION_URL}/message/sendText/${instanceName}`,
+  await axios.post(`${EVOLUTION_URL}/message/sendText/${instanceName}`,
     { number: phone, text: message },
-    { headers: { apikey: EVOLUTION_APIKEY, "Content-Type": "application/json" } }
-  );
+    { headers: { apikey: EVOLUTION_APIKEY, "Content-Type": "application/json" } });
 }
 
-app.post("/webhook", async (req, res) => handleWebhook(req, res));
-app.post("/webhook/:event", async (req, res) => handleWebhook(req, res));
-
-async function handleWebhook(req, res) {
+// ─── WEBHOOK DO WHATSAPP (mensagens dos clientes finais) ─────────────────────
+app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
     const body = req.body;
@@ -140,60 +124,141 @@ async function handleWebhook(req, res) {
 
     const instanceName = body.instance || body.data?.instanceName || "meu-bot";
     const phone = body.data.key.remoteJid.replace("@s.whatsapp.net", "");
-    const message = body.data.message.conversation ||
-      body.data.message.extendedTextMessage?.text || "";
+    const message = body.data.message.conversation || body.data.message.extendedTextMessage?.text || "";
     if (!message.trim()) return;
 
-    console.log(`📩 [${instanceName}] [${phone}] ${message}`);
-
-    // Busca config do cliente
     const client = await getClientConfig(instanceName);
-    if (!client) {
-      console.log(`⚠️ Cliente não encontrado para instância: ${instanceName}`);
-      return;
-    }
-
+    if (!client) { console.log(`⚠️ Cliente não encontrado: ${instanceName}`); return; }
     const { profile, botConfig } = client;
 
-    // Verifica modo automático
-    const auto = await isAutoMode(profile.id);
-    if (!auto) {
-      console.log(`⏸️ Modo manual ativo para ${instanceName}`);
+    // Verifica se o cliente tem acesso válido (pagou ou está em trial)
+    if (!hasValidAccess(profile)) {
+      console.log(`🔒 Acesso expirado para ${profile.name} (${profile.payment_status})`);
+      return; // Não responde — cliente sem acesso não deve gastar créditos de IA
+    }
+
+    // Verifica se o robô está ligado (controlado pelo cliente no painel)
+    if (profile.bot_enabled === false) {
+      console.log(`⏸️ Robô desligado para ${profile.name} — mensagem recebida mas não respondida`);
+      await sb.from("messages").insert({ user_id: profile.id, phone, direction: "in", content: message });
       return;
     }
 
-    // Verifica limite de mensagens
     const withinLimit = await checkMessageLimit(profile.id, profile.plan);
     if (!withinLimit) {
       await sendWhatsApp(instanceName, phone, "Nosso atendimento automático atingiu o limite do mês. Em breve retornaremos! 😊");
       return;
     }
 
-    // Gera resposta
     const reply = await askGroq(instanceName, phone, message, botConfig);
-    console.log(`🤖 [${instanceName}] ${reply}`);
-
-    // Salva mensagens no banco
     await sb.from("messages").insert({ user_id: profile.id, phone, direction: "in",  content: message });
     await sb.from("messages").insert({ user_id: profile.id, phone, direction: "out", content: reply });
 
-    // Verifica transferência para humano
     if (reply.includes("TRANSFERIR_HUMANO")) {
       const cleanReply = reply.replace("TRANSFERIR_HUMANO", "").trim();
       await sendWhatsApp(instanceName, phone, cleanReply);
       delete conversations[instanceName][phone];
       return;
     }
-
     await sendWhatsApp(instanceName, phone, reply);
   } catch (err) {
-    console.error("Erro no webhook:", err.message);
+    console.error("Erro no webhook WhatsApp:", err.message);
+  }
+});
+
+// ─── WEBHOOK DO MERCADO PAGO (pagamentos e assinaturas) ──────────────────────
+app.post("/webhook/mercadopago", async (req, res) => {
+  res.sendStatus(200); // Sempre responde 200 rápido pro Mercado Pago não reenviar
+  try {
+    const { type, data, action } = req.body;
+    console.log("💰 Webhook Mercado Pago recebido:", type, action, JSON.stringify(data));
+
+    // Tipo "payment" = pagamento avulso ou primeira cobrança de assinatura
+    if (type === "payment" && data?.id) {
+      const paymentRes = await axios.get(`https://api.mercadopago.com/v1/payments/${data.id}`, {
+        headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` }
+      });
+      const payment = paymentRes.data;
+
+      if (payment.status === "approved") {
+        const email = payment.payer?.email;
+        const amount = payment.transaction_amount;
+        const plan = planFromAmount(amount);
+
+        if (email) {
+          const { data: profile } = await sb.from("profiles").select("*").eq("email", email).single();
+          if (profile) {
+            await sb.from("profiles").update({
+              payment_status: "active",
+              plan: plan,
+              last_payment_at: new Date().toISOString(),
+              active: true,
+            }).eq("id", profile.id);
+            console.log(`✅ Pagamento confirmado e plano ${plan} ativado para ${email}`);
+          } else {
+            console.log(`⚠️ Pagamento recebido de e-mail não cadastrado: ${email}`);
+          }
+        }
+      }
+    }
+
+    // Tipo "subscription_preapproval" = eventos de assinatura recorrente
+    if (type === "subscription_preapproval" && data?.id) {
+      const subRes = await axios.get(`https://api.mercadopago.com/preapproval/${data.id}`, {
+        headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` }
+      });
+      const sub = subRes.data;
+      const email = sub.payer_email;
+
+      if (email) {
+        const { data: profile } = await sb.from("profiles").select("*").eq("email", email).single();
+        if (profile) {
+          let status = "trial";
+          if (sub.status === "authorized") status = "active";
+          if (sub.status === "cancelled" || sub.status === "paused") status = "cancelled";
+
+          const amount = sub.auto_recurring?.transaction_amount || 0;
+          const plan = planFromAmount(amount);
+
+          await sb.from("profiles").update({
+            payment_status: status,
+            plan: status === "active" ? plan : profile.plan,
+            mp_subscription_id: sub.id,
+            active: status !== "cancelled",
+          }).eq("id", profile.id);
+          console.log(`🔄 Assinatura atualizada para ${email}: ${status}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Erro no webhook Mercado Pago:", err.response?.data || err.message);
+  }
+});
+
+// ─── ROTINA DIÁRIA: expira trials vencidos ───────────────────────────────────
+async function expireTrials() {
+  try {
+    const { data: expiring } = await sb.from("profiles")
+      .select("*")
+      .eq("payment_status", "trial")
+      .lt("trial_ends_at", new Date().toISOString());
+
+    for (const profile of expiring || []) {
+      await sb.from("profiles").update({ payment_status: "expired" }).eq("id", profile.id);
+      console.log(`⏰ Trial expirado para ${profile.name} (${profile.email})`);
+    }
+  } catch (e) {
+    console.error("Erro ao expirar trials:", e.message);
   }
 }
+// Roda a cada 1 hora
+setInterval(expireTrials, 60 * 60 * 1000);
+expireTrials(); // roda uma vez ao iniciar
 
 app.get("/", (req, res) => {
-  res.json({ status: "✅ ZapBot online", ai: "Groq (gratuito)", conversations: Object.keys(conversations).length });
+  res.json({ status: "✅ ZapBot online", ai: "Groq (gratuito)", payments: "Mercado Pago conectado" });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`⚡ ZapBot rodando na porta ${PORT}`));
+    
