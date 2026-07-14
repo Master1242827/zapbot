@@ -259,6 +259,42 @@ app.get("/", (req, res) => {
   res.json({ status: "✅ ZapBot online", ai: "Groq (gratuito)", payments: "Mercado Pago conectado" });
 });
 
+// ─── MENSAGENS AGENDADAS ──────────────────────────────────────────────────────
+function getInstanceNameFromUserId(userId) {
+  return `zapbot-${userId.substring(0, 8)}`;
+}
+
+async function processScheduledMessages() {
+  try {
+    const now = new Date().toISOString();
+    const { data: due } = await sb
+      .from("scheduled_messages")
+      .select("*")
+      .eq("status", "pending")
+      .lte("send_at", now);
+
+    for (const sched of due || []) {
+      try {
+        const instanceName = getInstanceNameFromUserId(sched.user_id);
+        await sendWhatsApp(instanceName, sched.phone, sched.message);
+        await sb.from("scheduled_messages")
+          .update({ status: "sent", sent_at: new Date().toISOString() })
+          .eq("id", sched.id);
+        await sb.from("messages").insert({
+          user_id: sched.user_id, phone: sched.phone, direction: "out", content: sched.message,
+        });
+        console.log(`📅 Mensagem agendada enviada para ${sched.phone}`);
+      } catch (err) {
+        await sb.from("scheduled_messages").update({ status: "failed" }).eq("id", sched.id);
+        console.error(`❌ Falha ao enviar agendamento ${sched.id}:`, err.message);
+      }
+    }
+  } catch (e) {
+    console.error("Erro ao processar agendamentos:", e.message);
+  }
+}
+// Roda a cada 1 minuto
+setInterval(processScheduledMessages, 60 * 1000);
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`⚡ ZapBot rodando na porta ${PORT}`));
-    
