@@ -1,8 +1,10 @@
 const express = require("express");
 const axios = require("axios");
+const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 const GROQ_API_KEY     = process.env.GROQ_API_KEY;
@@ -232,6 +234,67 @@ app.post("/webhook/mercadopago", async (req, res) => {
     }
   } catch (err) {
     console.error("Erro no webhook Mercado Pago:", err.response?.data || err.message);
+  }
+});
+
+// ─── CHECKOUT TRANSPARENTE: cria a cobrança (cartão, Pix ou boleto) ──────────
+app.post("/create-payment", async (req, res) => {
+  try {
+    const { token, payment_method_id, issuer_id, installments, payer, transaction_amount, plan, description } = req.body;
+
+    if (!payment_method_id || !transaction_amount || !payer?.email) {
+      return res.status(400).json({ error: "Dados de pagamento incompletos." });
+    }
+
+    const payload = {
+      transaction_amount: Number(transaction_amount),
+      description: description || `ZapBot - Plano ${plan || ""}`,
+      payment_method_id,
+      payer,
+      notification_url: "https://zapbot-production-be1c.up.railway.app/webhook/mercadopago",
+      external_reference: plan || "",
+    };
+    if (token) payload.token = token;
+    if (installments) payload.installments = Number(installments);
+    if (issuer_id) payload.issuer_id = issuer_id;
+
+    const idempotencyKey = `${payer.email}-${Date.now()}`;
+    const mpRes = await axios.post("https://api.mercadopago.com/v1/payments", payload, {
+      headers: {
+        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": idempotencyKey,
+      },
+    });
+
+    const p = mpRes.data;
+
+    // Se já aprovou na hora (cartão de crédito costuma responder na hora), ativa direto
+    // — o webhook também vai confirmar em paralelo, sem problema duplicar.
+    if (p.status === "approved" && payer.email) {
+      const planName = plan || planFromAmount(p.transaction_amount);
+      const { data: profile } = await sb.from("profiles").select("*").eq("email", payer.email).single();
+      if (profile) {
+        await sb.from("profiles").update({
+          payment_status: "active",
+          plan: planName,
+          last_payment_at: new Date().toISOString(),
+          active: true,
+        }).eq("id", profile.id);
+      }
+    }
+
+    res.json({
+      status: p.status,
+      status_detail: p.status_detail,
+      id: p.id,
+      qr_code: p.point_of_interaction?.transaction_data?.qr_code || null,
+      qr_code_base64: p.point_of_interaction?.transaction_data?.qr_code_base64 || null,
+      ticket_url: p.transaction_details?.external_resource_url || p.point_of_interaction?.transaction_data?.ticket_url || null,
+    });
+  } catch (err) {
+    console.error("Erro ao criar pagamento:", err.response?.data || err.message);
+    res.status(400).json({ error: err.response?.data?.message || "Erro ao processar pagamento." });
   }
 });
 
